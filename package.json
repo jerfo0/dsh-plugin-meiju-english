@@ -1,0 +1,60 @@
+{
+  "name": "dsh-plugin-meiju-english",
+  "version": "1.0.0",
+  "description": "Meiju English Learning for DeepSeek Harness: turn a US-TV episode plus bilingual subtitles into trimmed listening audio, sentence clips, offline-SenseVoice shadowing with word-level scoring, quizzes and a phone listening page. 美剧英语学习：把美剧视频和中英字幕变成去头尾音频、逐句跟读评分、测试题和手机磨耳朵页面。",
+  "license": "MIT",
+  "author": "jerfo0",
+  "type": "module",
+  "main": "./plugin/index.js",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jerfo0/dsh-plugin-meiju-english.git"
+  },
+  "homepage": "https://github.com/jerfo0/dsh-plugin-meiju-english",
+  "bugs": {
+    "url": "https://github.com/jerfo0/dsh-plugin-meiju-english/issues"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "deepseek",
+    "english-learning",
+    "subtitles",
+    "shadowing",
+    "listening"
+  ],
+  "exports": {
+    ".": "./plugin/index.js",
+    "./client": "./plugin/client.js",
+    "./locale/*.json": "./plugin/locale/*.json",
+    "./icon": "./plugin/icon.svg",
+    "./cordis.patch.yml": "./plugin/cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "plugin",
+    "tools",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./plugin/cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

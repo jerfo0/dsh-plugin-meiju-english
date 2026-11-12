@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#171210">
+<meta name="color-scheme" content="dark">
+<meta name="robots" content="noindex, nofollow">
+<title>{{TITLE}} · 美剧英语磨耳朵</title>
+<style>
+  :root {
+    --meiju-bg: #171210;
+    --meiju-card: #241b16;
+    --meiju-card-soft: #2c211a;
+    --meiju-line: #3d2f26;
+    --meiju-text: #f6ecdf;
+    --meiju-muted: #b7a390;
+    --meiju-accent: #e4572e;
+    --meiju-cream: #f7d9b6;
+  }
+  *, *::before, *::after { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    background: radial-gradient(130% 70% at 50% 0%, #2b1e17 0%, var(--meiju-bg) 58%, #0f0b09 100%);
+    color: var(--meiju-text);
+    font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    line-height: 1.6;
+  }
+  .meiju-wrap { width: 100%; max-width: 620px; margin: 0 auto; padding: 26px 18px 56px; }
+  .meiju-kicker {
+    margin: 0 0 10px;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--meiju-accent);
+  }
+  .meiju-title { margin: 0; font-size: 26px; line-height: 1.28; font-weight: 800; color: var(--meiju-cream); }
+  .meiju-title-en { margin: 6px 0 0; font-size: 14px; font-style: italic; color: var(--meiju-muted); }
+  .meiju-title-en:empty { display: none; }
+  .meiju-show { margin: 12px 0 0; font-size: 13px; color: var(--meiju-muted); }
+  .meiju-show:empty { display: none; }
+  .meiju-player {
+    margin: 22px 0 14px;
+    padding: 16px;
+    border-radius: 18px;
+    background: linear-gradient(150deg, var(--meiju-card-soft), var(--meiju-card));
+    border: 1px solid var(--meiju-line);
+    box-shadow: 0 18px 40px rgba(0, 0, 0, 0.32);
+  }
+  .meiju-player audio { display: block; width: 100%; height: 46px; }
+  .meiju-player-note { margin: 12px 2px 0; font-size: 12.5px; color: var(--meiju-muted); }
+  .meiju-wifi {
+    margin: 0 0 22px;
+    padding: 12px 14px;
+    border-radius: 14px;
+    background: rgba(228, 87, 46, 0.12);
+    border: 1px dashed rgba(228, 87, 46, 0.5);
+    color: #f3c7ac;
+    font-size: 13px;
+  }
+  .meiju-list-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin: 0 0 12px; }
+  .meiju-list-head h2 { margin: 0; font-size: 16px; font-weight: 700; color: var(--meiju-cream); }
+  .meiju-list-head span { font-size: 12px; color: var(--meiju-muted); }
+  .meiju-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+  .meiju-list li {
+    display: flex;
+    gap: 12px;
+    padding: 12px 14px;
+    border-radius: 14px;
+    background: rgba(255, 255, 255, 0.035);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+  }
+  .meiju-list li.empty { justify-content: center; color: var(--meiju-muted); font-size: 13px; }
+  .meiju-list li.line { cursor: pointer; transition: background .15s ease, border-color .15s ease; }
+  .meiju-list li.line:active { background: rgba(255, 255, 255, 0.07); }
+  .meiju-list li.line.active {
+    background: rgba(228, 87, 46, 0.16);
+    border-color: rgba(228, 87, 46, 0.55);
+    box-shadow: 0 0 0 1px rgba(228, 87, 46, 0.25) inset;
+  }
+  .meiju-list li.line.active .en { color: #ffffff; }
+  .meiju-list li.line.active .idx { color: var(--meiju-cream); }
+  .meiju-list .idx { flex: 0 0 34px; padding-top: 3px; font-size: 12px; font-weight: 700; color: var(--meiju-accent); }
+  .meiju-list .lines { flex: 1 1 auto; min-width: 0; }
+  .meiju-list .en { margin: 0; font-size: 15px; font-weight: 600; color: var(--meiju-text); }
+  .meiju-list .zh { margin: 3px 0 0; font-size: 13px; color: var(--meiju-muted); }
+  .meiju-back {
+    margin: 28px 0 0;
+    padding-top: 18px;
+    border-top: 1px solid var(--meiju-line);
+    font-size: 13px;
+    color: var(--meiju-muted);
+    text-align: center;
+  }
+  @media (max-width: 380px) {
+    .meiju-title { font-size: 22px; }
+    .meiju-list .idx { flex-basis: 28px; }
+  }
+</style>
+</head>
+<body>
+<main class="meiju-wrap">
+  <p class="meiju-kicker">美剧英语 · 磨耳朵</p>
+  <h1 class="meiju-title">{{TITLE}}</h1>
+  <p class="meiju-title-en">{{TITLE_EN}}</p>
+  <p class="meiju-show">{{SHOW}}</p>
+  <section class="meiju-player">
+    <audio controls preload="metadata" src="{{AUDIO_URL}}"></audio>
+    <p class="meiju-player-note">已自动去掉片头、主题曲和片尾，只保留正片对白。</p>
+  </section>
+  <p class="meiju-wifi">手机与电脑连同一个 Wi-Fi 才能打开本页并播放音频。</p>
+  <section>
+    <div class="meiju-list-head">
+      <h2>逐句台词</h2>
+      <span>播放时自动高亮当前句 · 点句子跳转</span>
+    </div>
+    <ul class="meiju-list">{{SENTENCES}}</ul>
+  </section>
+  <p class="meiju-back">想跟读、做测试题？回到电脑上的 DSH「美剧英语」面板继续学习。</p>
+</main>
+<script>
+(function () {
+  var audio = document.querySelector('audio');
+  var nodes = document.querySelectorAll('.meiju-list li[data-start]');
+  if (!audio || !nodes.length) return;
+  var rows = [];
+  for (var i = 0; i < nodes.length; i++) {
+    var s = parseFloat(nodes[i].getAttribute('data-start'));
+    if (!isNaN(s)) rows.push({ el: nodes[i], start: s });
+  }
+  var last = null;
+  function update() {
+    var t = audio.currentTime || 0;
+    var active = null;
+    for (var i = 0; i < rows.length; i++) {
+      if (t >= rows[i].start - 0.15) active = rows[i];
+      else break;
+    }
+    if (active && active !== last) {
+      if (last) last.el.classList.remove('active');
+      active.el.classList.add('active');
+      last = active;
+      try { active.el.scrollIntoView({ block: 'center', behavior: 'smooth' }); }
+      catch (e) { try { active.el.scrollIntoView(); } catch (e2) { /* ignore */ } }
+    }
+  }
+  audio.addEventListener('timeupdate', update);
+  audio.addEventListener('seeked', update);
+  audio.addEventListener('loadedmetadata', update);
+  function bind(row) {
+    row.el.addEventListener('click', function () {
+      try { audio.currentTime = row.start; audio.play(); } catch (e) { /* ignore */ }
+    });
+  }
+  for (var j = 0; j < rows.length; j++) bind(rows[j]);
+  update();
+})();
+</script>
+</body>
+</html>

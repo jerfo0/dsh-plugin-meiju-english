@@ -1,0 +1,117 @@
+# 美剧英语学习 · Meiju English Learning
+
+一个装进 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）Web 端的美剧英语学习插件：给它**一集美剧视频 + 中英双语字幕**，它把这一集变成一整套可以按顺序学完的英语物料。
+
+*Turn one US-TV episode plus BOM-bilingual `.ass` subtitles into trimmed listening audio, sentence clips, offline pronunciation scoring, quizzes, and a phone listening page — all processed locally on your machine.*
+
+![美剧英语学习预览](docs/assets/show.jpg)
+
+## 功能
+
+| 步骤 | 内容 |
+|---|---|
+| 0 生成物料 | 调用本机 ffmpeg：生成浏览器可播放的视频代理、**去掉片头/片尾曲的完整音频**、按字幕切好的**逐句音频片段**，并输出 `material.json` |
+| 1 带中英字幕观看 | 页面内播放本集视频，中英字幕按时间轴同步（可切 双语 / 英文 / 中文），看到 98% 才算完成 |
+| 2 无字幕观看 | 同一视频关闭字幕再听一遍，检验真实听力 |
+| 3 测试 | 一题一屏、全部点选（选择 / 多选勾选 / 选词填空 / 语法 / 翻译 / 听力），每题带中文解析；连续错 5 题整轮重来，错题打乱重做，错题轮连续 3 次没全对即本次不过关；随时可看错题解析 |
+| 4 跟读练习 | 逐句跟读录音 → **本机离线 SenseVoice 语音识别**做词级准确度评分（读对 ≥70% 的单词即过关，不要求语速/时长一致），原句逐词绿（读对）/红（读错）高亮 + 漏读词提示；自动记住上次读到第几句 |
+| 5 磨耳朵 | 去头尾的完整音频播放器，可按"去头尾后的时间轴"逐句跳转；生成**手机链接**，同一 Wi-Fi 下手机浏览器打开即可听，页面自动高亮当前句、点句子跳转 |
+
+## 环境要求
+
+- **DeepSeek Harness**（Web 或 Desktop 版即可，自带 Node 运行时；插件面向 `web` 平台）
+- **ffmpeg / ffprobe** 在 `PATH` 中，或通过环境变量 `FFMPEG_PATH` / `FFPROBE_PATH` 指定（生成物料必需）
+- **可选**：Python 3.10+ 与 Pillow（仅用于批量生成原创海报 `tools/posters.py`）
+- **可选（推荐）**：DSH 自带实验插件 `speech-to-text` + `speech-to-text-sensevoice`（本地离线语音识别）。多数发行版已内置；没有时跟读会降级为自评，不影响其他功能
+
+## 安装
+
+**方式一：插件市场（上架后）**
+
+> 插件 → 发现 → 搜索「美剧英语」→ 安装。
+
+**方式二：直接从 GitHub 安装**
+
+```bash
+dsh plugin --profile web add github:jerfo0/dsh-plugin-meiju-english
+```
+
+安装后在 DSH 中启用 `dsh-plugin-meiju-english`（插件页会显示「美剧英语」），**重启 DSH 或刷新页面**，左侧图标栏就会出现「美剧英语」。
+
+> Host 端代码在 DSH 启动时加载，所以首次安装后需要重启一次 DSH；之后升级插件同理。
+
+## 快速开始
+
+1. 点左侧「美剧英语」→ 首次进入会要求填两个目录：**视频目录**与**字幕目录**（可以是同一个）。
+2. 点「扫描剧集」：按文件名里的 `s01e01` 这类集号，自动把视频与字幕配对。
+3. 点某一集 →「生成本集物料」，等待 ffmpeg 处理（一集约几分钟，取决于机器）。
+4. 生成完成后按 1→5 步学习。进度保存在浏览器本机（localStorage），可随时中断。
+
+### 对素材的要求
+
+- 视频：`.mkv` / `.mp4` / `.avi`，文件名包含 `s01e01`（季/集号）。
+- 字幕：**中英双语 `.ass`**（同格式 `.ssa` 亦可）。同一句的英文与中文时间轴重叠，插件会自动配对；纯中文或纯英文字幕也能生成，但学习体验以双语最佳。
+- 每一集的物料只在本机生成、本机保存，不会上传到任何服务器。
+
+### 数据与磁盘占用
+
+默认数据目录是**插件包目录下的 `data/`**。生成一集的物料通常是：视频代理数百 MB + 去头尾音频约 20 MB + 逐句片段约 10 MB。
+
+建议把数据目录指到固定位置，避免升级插件时丢失。编辑你的 DSH profile 的 `cordis.patch.yml`：
+
+```yaml
+- id: meiju-english
+  name: dsh-plugin-meiju-english
+  config:
+    # Windows 示例，换成你的路径
+    dataRoot: C:\Users\<你>\.dsh\meiju-english\data
+    # 手机听力的局域网端口（被占用会自动顺延）
+    lanPort: 8791
+```
+
+## 手机磨耳朵
+
+在第 5 步点「生成手机链接」，得到形如 `http://192.168.x.x:8791/listen/s01e01` 的地址：
+
+- 手机与电脑连接**同一个 Wi-Fi**，用手机浏览器打开即可播放去掉片头片尾的完整音频；
+- 页面会随播放自动高亮当前句，点任意一句可跳到那句；
+- 打不开时检查 Windows 防火墙是否放行该端口，或改用面板显示的实际 IP。
+
+## 跟读评分如何工作
+
+- 录音在浏览器里转换成 **16 kHz 单声道 PCM16 WAV**，交给 DSH Host 的本地 `speechToText` 服务（SenseVoice，`host-local`，不联网）；
+- 识别文本与原句做词级 LCS 比对：得分 = 读对的原句单词数 ÷ 原句总词数，**≥70 过关**，录音时长为时不参与评分；
+- 原句逐词高亮，并列出「这几个词再读清楚一点」；
+- 首次使用若本地模型尚未准备，会在步骤 4 显示「开始准备模型」，自动从镜像下载约 228 MB（只下载一次，之后完全离线）。
+
+## 常见问题
+
+| 现象 | 处理 |
+|---|---|
+| 面板报 `HTTP 404 · not found` | 插件 Host 端未激活：确认插件已启用，并**重启 DSH**（不是只刷新页面） |
+| 生成物料失败，提示找不到 ffmpeg | 安装 ffmpeg 并加入 `PATH`，或设置 `FFMPEG_PATH` / `FFPROBE_PATH` 指向可执行文件 |
+| 步骤 4 提示语音模型不可用 | 检查 DSH 插件页是否启用了 `speech-to-text-sensevoice`；没有则跟读降级为自评 |
+| 手机打不开链接 | 确认同一 Wi-Fi、防火墙放行端口（默认 8791，可能顺延到 8792–8796） |
+| 字幕没配对 / 集数不全 | 文件名需要包含 `s01e01` 形式；字幕放在字幕目录下 |
+
+## 目录结构
+
+```
+plugin/                 DSH bundle（Host index.js + Web client.js + 手机页 + 图标/语言包）
+  index.js              API、生成任务、Range 流媒体、手机页、STT 路由
+  client.js             侧边栏面板：剧集列表 + 6 步学习流程
+tools/
+  build_episode.mjs     字幕解析 / 去头尾 / 切片 / material.json 生成
+  posters.py            原创海报生成（Pillow，可选）
+docs/assets/            README 与市场展示用原创图片
+```
+
+## 版权与隐私
+
+- 本仓库**不包含任何影视视频、音频或字幕内容**；使用者需要自行提供自己有权使用的视频与字幕文件。
+- 所有处理都在本机完成：ffmpeg 转码、字幕解析、语音识别均不联网（SenseVoice 模型仅首次从镜像下载）。
+- 生成的物料保存在你自己的数据目录，请勿公开传播受版权保护的影视内容。
+
+## License
+
+[MIT](LICENSE)

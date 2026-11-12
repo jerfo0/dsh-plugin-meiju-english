@@ -1,0 +1,18 @@
+# Local media and generated learning material (copyright + size):
+# an episode proxy may be ~800 MB and the derived audio/subtitles are the show's content.
+/data/
+
+# Development-only harnesses, logs and test audio
+/verification/
+/recon/
+*.log
+
+# Dependencies / editor / OS noise
+node_modules/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Machine-local overrides
+*.local.json

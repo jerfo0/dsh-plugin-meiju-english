@@ -1,0 +1,7 @@
+# Keep the published sources LF on every platform.
+* text=auto eol=lf
+*.jpg binary
+*.jpeg binary
+*.png binary
+*.webp binary
+*.gif binary

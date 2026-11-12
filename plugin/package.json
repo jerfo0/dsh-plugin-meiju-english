@@ -1,0 +1,46 @@
+{
+  "name": "dsh-plugin-meiju-english",
+  "version": "1.0.0",
+  "private": true,
+  "description": "DSH 插件：美剧英语学习。用美剧视频和中英字幕生成去头尾音频、逐句片段、测试题、跟读与手机听力链接。",
+  "keywords": ["dsh-plugin", "deepseek-harness", "english-learning", "subtitles", "listening"],
+  "license": "MIT",
+  "icon": "./icon.svg",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "listen.html",
+    "locale",
+    "icon.svg",
+    "cordis.patch.yml"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  }
+}

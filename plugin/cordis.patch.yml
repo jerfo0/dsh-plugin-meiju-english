@@ -1,0 +1,4 @@
+# dsh bundle patch: inserts the Meiju English learning panel into a profile's layer stack.
+- insert:
+    - id: meiju-english
+      name: 'dsh-plugin-meiju-english'
