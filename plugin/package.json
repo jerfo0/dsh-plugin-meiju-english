@@ -1,9 +1,15 @@
 {
   "name": "dsh-plugin-meiju-english",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "description": "DSH 插件：美剧英语学习。用美剧视频和中英字幕生成去头尾音频、逐句片段、测试题、跟读与手机听力链接。",
-  "keywords": ["dsh-plugin", "deepseek-harness", "english-learning", "subtitles", "listening"],
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "english-learning",
+    "subtitles",
+    "listening"
+  ],
   "license": "MIT",
   "icon": "./icon.svg",
   "type": "module",

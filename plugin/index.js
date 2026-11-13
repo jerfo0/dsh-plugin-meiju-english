@@ -842,7 +842,8 @@ function handleProgressLine(job, line) {
   }
 }
 
-function startGenerate(episode) {
+function startGenerate(episode, mode) {
+  const quizOnly = mode === 'quiz';
   const runningId = state.episodeJobs.get(episode.episodeId);
   if (runningId) {
     const running = state.jobs.get(runningId);
@@ -850,17 +851,26 @@ function startGenerate(episode) {
     state.episodeJobs.delete(episode.episodeId);
   }
 
-  if (!episode.subtitle) fail(400, '本集没有字幕文件，暂不能生成物料（请先扫描到与本集视频配对的字幕）');
-  if (!isFile(episode.video)) fail(400, `视频文件不存在：${episode.video}`);
-  if (!isFile(episode.subtitle)) fail(400, `字幕文件不存在：${episode.subtitle}`);
+  if (quizOnly) {
+    const materialFile = path.join(episodeDir(episode.episodeId), 'material.json');
+    if (!isFile(materialFile)) fail(400, '本集还没有生成物料，请先生成物料再生成测试题');
+  } else {
+    if (!episode.subtitle) fail(400, '本集没有字幕文件，暂不能生成物料（请先扫描到与本集视频配对的字幕）');
+    if (!isFile(episode.video)) fail(400, `视频文件不存在：${episode.video}`);
+    if (!isFile(episode.subtitle)) fail(400, `字幕文件不存在：${episode.subtitle}`);
+  }
   if (!isFile(BUILDER_SCRIPT)) fail(500, `物料生成脚本不存在：${BUILDER_SCRIPT}`);
 
   const job = {
     id: newJobId(),
-    kind: 'generate',
+    kind: quizOnly ? 'quiz' : 'generate',
     episodeId: episode.episodeId,
     status: 'running',
-    progress: { stage: 'init', pct: 0, message: '正在启动物料生成…' },
+    progress: {
+      stage: 'init',
+      pct: 0,
+      message: quizOnly ? '正在生成测试题…' : '正在启动物料生成…',
+    },
     result: null,
     error: null,
     errorTail: '',
@@ -873,20 +883,24 @@ function startGenerate(episode) {
   state.jobs.set(job.id, job);
   state.episodeJobs.set(episode.episodeId, job.id);
 
-  const args = [
-    BUILDER_SCRIPT,
-    '--episode',
-    episode.episodeId,
-    '--video',
-    episode.video,
-    '--subtitle',
-    episode.subtitle,
-    '--data',
-    state.dataRoot,
-  ];
-  if (episode.titleEn) args.push('--title-en', episode.titleEn);
-  if (episode.titleZh) args.push('--title-zh', episode.titleZh);
-  if (episode.force === true) args.push('--force');
+  const args = quizOnly
+    ? [BUILDER_SCRIPT, '--episode', episode.episodeId, '--data', state.dataRoot, '--quiz-only']
+    : [
+      BUILDER_SCRIPT,
+      '--episode',
+      episode.episodeId,
+      '--video',
+      episode.video,
+      '--subtitle',
+      episode.subtitle,
+      '--data',
+      state.dataRoot,
+    ];
+  if (!quizOnly) {
+    if (episode.titleEn) args.push('--title-en', episode.titleEn);
+    if (episode.titleZh) args.push('--title-zh', episode.titleZh);
+    if (episode.force === true) args.push('--force');
+  }
 
   let child;
   try {
@@ -953,6 +967,17 @@ function handleGenerate(body) {
   const episode = catalog.episodes.find((item) => item.episodeId === episodeId);
   if (!episode) fail(404, `剧集目录里没有 ${episodeId}，请先扫描视频目录`);
   return startGenerate({ ...episode, force: body.force === true });
+}
+
+/** Generate only quiz.json from an existing material.json (fast, no ffmpeg). */
+function handleQuiz(body) {
+  const episodeId = normalizeEpisodeId(body.episodeId);
+  if (!episodeId) fail(400, 'episodeId 无效，应形如 s01e01');
+  const catalog = normalizeCatalog(readCatalogRaw());
+  const episode = catalog.episodes.find((item) => item.episodeId === episodeId);
+  const materialFile = path.join(episodeDir(episodeId), 'material.json');
+  if (!isFile(materialFile)) fail(400, '本集还没有生成物料，请先生成物料再生成测试题');
+  return startGenerate(episode || { episodeId }, 'quiz');
 }
 
 // ---------------------------------------------------------------------------
@@ -1915,6 +1940,7 @@ const API_ROUTES = [
         'GET /material?episodeId=s01e01',
         'POST /scan {mediaDir, subtitleDir}',
         'POST /generate {episodeId}',
+        'POST /quiz {episodeId}',
         'GET /job?id=',
         'GET /media?p=episodes/s01e01/assets/full.mp3',
         'GET /lan',
@@ -1929,6 +1955,7 @@ const API_ROUTES = [
   { path: '/material', methods: ['GET', 'HEAD'], run: async (req, res, url) => handleMaterial(url) },
   { path: '/scan', methods: ['POST'], run: async (req) => handleScan(await readJsonBody(req)) },
   { path: '/generate', methods: ['POST'], run: async (req) => handleGenerate(await readJsonBody(req)) },
+  { path: '/quiz', methods: ['POST'], run: async (req) => handleQuiz(await readJsonBody(req)) },
   { path: '/job', methods: ['GET', 'HEAD'], run: async (req, res, url) => handleJob(url) },
   {
     path: '/media',

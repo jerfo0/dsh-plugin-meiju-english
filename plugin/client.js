@@ -2061,7 +2061,7 @@ window.__ModuleLoader__.load({
         return h(EmptyState, {
           icon: 'settings',
           title: '本集测试题还未生成',
-          desc: '测试题（quiz.json）由内容侧生成。生成后刷新页面即可开始测试。',
+          desc: '测试题通常随物料自动生成；旧物料可以在步骤 3 里点「生成测试题」单独补生成，或回步骤 0 重新生成物料。',
         });
       }
 
@@ -3981,6 +3981,15 @@ window.__ModuleLoader__.load({
       var genBusyState = React.useState(false);
       var genBusy = genBusyState[0];
       var setGenBusy = genBusyState[1];
+      var quizGenBusyState = React.useState(false);
+      var quizGenBusy = quizGenBusyState[0];
+      var setQuizGenBusy = quizGenBusyState[1];
+      var quizGenMsgState = React.useState('');
+      var quizGenMsg = quizGenMsgState[0];
+      var setQuizGenMsg = quizGenMsgState[1];
+      var quizGenErrState = React.useState('');
+      var quizGenErr = quizGenErrState[0];
+      var setQuizGenErr = quizGenErrState[1];
       var openState = React.useState(null);
       var openMap = openState[0];
       var setOpenMap = openState[1];
@@ -4107,8 +4116,43 @@ window.__ModuleLoader__.load({
         }
       }
 
-      function doResetProgress() {
+      // 旧物料补生成测试题（只跑 quiz 生成，不重新转码视频/音频）
+      async function startQuizGenerate() {
+        if (quizGenBusy) return;
+        setQuizGenErr('');
+        setQuizGenMsg('正在生成测试题…');
+        setQuizGenBusy(true);
         try {
+          var res = await apiPost('/quiz', { episodeId: epId });
+          if (!mountedRef.current) return;
+          var jid = res.jobId || (res.job && res.job.id) || '';
+          if (!jid) throw new Error('后端没有返回任务编号');
+          var deadline = Date.now() + 5 * 60 * 1000;
+          while (mountedRef.current && Date.now() < deadline) {
+            await sleep(800);
+            if (!mountedRef.current) return;
+            var jr = await apiGet('/job?id=' + encodeURIComponent(jid));
+            if (!mountedRef.current) return;
+            var job = jr.job || jr;
+            var pr = job.progress || {};
+            if (pr.message) setQuizGenMsg(pr.message);
+            if (job.status === 'done') {
+              await loadMaterial(false);
+              if (p.onLibraryRefresh) p.onLibraryRefresh();
+              setQuizGenMsg('测试题已生成，可以开始做题了');
+              return;
+            }
+            if (job.status === 'error') throw new Error(job.error || '生成测试题失败');
+          }
+          throw new Error('生成测试题超时，请稍后重试');
+        } catch (e) {
+          if (mountedRef.current) setQuizGenErr('生成测试题失败：' + msgOf(e));
+        } finally {
+          if (mountedRef.current) setQuizGenBusy(false);
+        }
+      }
+
+      function doResetProgress() {        try {
           var ok = window.confirm('确定要重置本集的学习进度吗？观看记录、测试通过状态和跟读过关记录都会清空。');
           if (!ok) return;
         } catch (e) { /* confirm 不可用就直接重置 */ }
@@ -4242,11 +4286,27 @@ window.__ModuleLoader__.load({
           );
         }
         if (!quiz || !Array.isArray(quiz.questions) || !quiz.questions.length) {
-          return h(EmptyState, {
-            icon: 'settings',
-            title: '本集测试题还未生成',
-            desc: '测试题（quiz.json）由内容侧生成。生成后刷新页面即可开始测试。',
-          });
+          if (!material) {
+            return h(EmptyState, {
+              icon: 'settings',
+              title: '还没有本集物料',
+              desc: '请先在步骤 0 生成物料，测试题会随物料一起自动生成。',
+            });
+          }
+          return h('div', { style: S.card },
+            h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', fontWeight: 650, fontSize: '15px' } },
+              h(Icon, { name: 'settings', size: 16 }),
+              '本集测试题还未生成'),
+            h('div', { style: S.noteSmall },
+              '新生成的物料会自动附带测试题；这一集是旧版生成的物料，可以点下面按钮单独补生成测试题，不需要重新转码视频。'),
+            h('div', { style: { marginTop: '10px', display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } },
+              h(Btn, { variant: 'primary', icon: 'sparkle', onClick: startQuizGenerate, disabled: quizGenBusy },
+                quizGenBusy ? '正在生成…' : '生成测试题'),
+              quizGenErr
+                ? h('span', { style: { fontSize: '12px', color: C.danger } }, quizGenErr)
+                : (quizGenMsg ? h('span', { style: { fontSize: '12px', opacity: 0.7 } }, quizGenMsg) : null)
+            )
+          );
         }
         return h(QuizPanel, {
           quiz: quiz,

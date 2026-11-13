@@ -149,8 +149,10 @@ const USAGE = [
   'usage: node tools/build_episode.mjs --episode <id> --video <mkv> --subtitle <ass> --data <dataDir>',
   '       [--title-en "..."] [--title-zh "..."] [--force]',
   '       [--theme-gap-min <seconds>] [--season <n>] [--number <n>]',
+  '       [--quiz-only]   (only (re)generate quiz.json from an existing material.json)',
   '',
-  'Builds data/episodes/<id>/{assets/video.mp4,assets/full.mp3,assets/clips/segNNNN.mp3,material.json}.',
+  'Builds data/episodes/<id>/{assets/video.mp4,assets/full.mp3,assets/clips/segNNNN.mp3,material.json,quiz.json}.',
+  'quiz.json is generated automatically when missing (or regenerated with --force / --quiz-only).',
   'Prints one JSON progress object per line on stdout.',
 ].join('\n');
 
@@ -166,6 +168,7 @@ function parseArgs(argv) {
     number: null,
     themeGapMin: null,
     force: false,
+    quizOnly: false,
     help: false,
   };
 
@@ -197,6 +200,11 @@ function parseArgs(argv) {
     if (key === 'force') {
       if (value !== undefined) throw new Error('option --force does not take a value');
       out.force = true;
+      continue;
+    }
+    if (key === 'quiz-only') {
+      if (value !== undefined) throw new Error('option --quiz-only does not take a value');
+      out.quizOnly = true;
       continue;
     }
     if (key === 'help' || key === 'h') {
@@ -392,6 +400,38 @@ function cleanText(input) {
 }
 
 /**
+ * Split one ASS cue into cleaned logical lines BEFORE cleaning, because some
+ * subtitle files put the Chinese and the English line in the SAME cue separated
+ * by `\N` (e.g. Friends.S01E02.chs&eng.ass uses one "Default" style only).
+ */
+function splitCueLines(raw) {
+  const normalized = String(raw == null ? '' : raw)
+    .replace(/\\N/g, '\n')
+    .replace(/\\n/g, '\n')
+    .replace(/<br\s*\/?>/gi, '\n');
+  const lines = [];
+  for (const part of normalized.split('\n')) {
+    const cleaned = cleanText(part);
+    if (!cleaned) continue;
+    if (!HAS_LETTER_OR_NUMBER_RE.test(cleaned)) continue;
+    lines.push(cleaned);
+  }
+  return lines;
+}
+
+/** Guess a cleaned line's language from the script it uses (CJK vs Latin). */
+function languageOf(text) {
+  const hasCjk = CJK_RE.test(text);
+  const hasLatin = /[A-Za-z]/.test(text);
+  if (hasCjk && !hasLatin) return 'zh';
+  if (hasLatin && !hasCjk) return 'en';
+  if (!hasCjk && !hasLatin) return null;
+  const cjk = (text.match(/[\u4e00-\u9fff]/g) || []).length;
+  const latin = (text.match(/[A-Za-z]/g) || []).length;
+  return cjk >= latin ? 'zh' : 'en';
+}
+
+/**
  * Parse an .ass file into referenced style names and timed dialogue cues.
  * @returns {{styles: Set<string>, cues: Array<{start:number,end:number,style:string,name:string,text:string}>}}
  */
@@ -493,11 +533,31 @@ function lowerBound(values, target) {
  */
 function buildSegments(cues) {
   const items = [];
+  const direct = [];
   for (const cue of cues) {
-    const text = cleanText(cue.text);
-    if (!text) continue;
-    if (!HAS_LETTER_OR_NUMBER_RE.test(text)) continue; // drop "■", punctuation-only graphics
-    const lane = laneOf(cue.style, text);
+    const lines = splitCueLines(cue.text);
+    if (!lines.length) continue;
+    const enParts = [];
+    const zhParts = [];
+    for (const line of lines) {
+      const lang = languageOf(line);
+      if (lang === 'en') enParts.push(line);
+      else if (lang === 'zh') zhParts.push(line);
+    }
+    if (enParts.length && zhParts.length) {
+      // Bilingual in one cue ("中文\NEnglish"): no cross-cue pairing needed.
+      direct.push({
+        start: cue.start,
+        end: cue.end,
+        en: enParts.join(' '),
+        zh: zhParts.join(' '),
+        paired: true,
+      });
+      continue;
+    }
+    const text = lines.join(' ');
+    if (!HAS_LETTER_OR_NUMBER_RE.test(text)) continue;
+    const lane = enParts.length ? 'en' : zhParts.length ? 'zh' : laneOf(cue.style, text);
     if (!lane) continue;
     items.push({ start: cue.start, end: cue.end, lane, text });
   }
@@ -550,6 +610,7 @@ function buildSegments(cues) {
     if (usedZh.has(i)) continue;
     segments.push({ start: z.start, end: z.end, en: '', zh: z.text, paired: false });
   }
+  for (const d of direct) segments.push(d);
 
   segments.sort((a, b) => (a.start - b.start) || (a.end - b.end));
 
@@ -851,6 +912,384 @@ async function runPool(items, limit, worker, onProgress) {
 // Main
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Automatic quiz generation (selection-only, v2 schema)
+//
+// Every episode gets a quiz derived from its own bilingual segments, so no
+// hand authoring is needed. It is deterministic per episode, uses only
+// tap-to-answer questions (choice / multi / fill / grammar / translate /
+// listening), and never copies content from another episode.
+// ---------------------------------------------------------------------------
+
+const QUIZ_MAX_QUESTIONS = 22;
+
+const QUIZ_STOPWORDS = new Set([
+  'the', 'a', 'an', 'and', 'or', 'but', 'if', 'so', 'because', 'that', 'this', 'these', 'those',
+  'i', 'you', 'he', 'she', 'it', 'we', 'they', 'me', 'him', 'her', 'us', 'them', 'my', 'your',
+  'his', 'its', 'our', 'their', 'mine', 'yours', 'hers', 'ours', 'theirs',
+  'am', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+  'have', 'has', 'had', 'having', 'do', 'does', 'did', 'done', 'doing',
+  'will', 'would', 'can', 'could', 'shall', 'should', 'may', 'might', 'must',
+  'not', 'no', 'yes', 'oh', 'ah', 'hey', 'hi', 'hello', 'well', 'just', 'really',
+  'what', 'who', 'whom', 'whose', 'which', 'when', 'where', 'why', 'how',
+  'there', 'here', 'then', 'than', 'now', 'too', 'very', 'also', 'about', 'with',
+  'for', 'from', 'into', 'onto', 'over', 'under', 'again', 'once', 'all', 'any',
+  'some', 'such', 'only', 'own', 'same', 'other', 'more', 'most', 'much', 'many',
+  'one', 'two', 'three', 'first', 'last', 'get', 'got', 'go', 'going', 'went',
+  'gonna', 'wanna', 'gotta', 'yeah', 'yep', 'nope', 'okay', 'ok', 'well',
+  'know', 'think', 'like', 'want', 'say', 'said', 'tell', 'told', 'make', 'made',
+  'take', 'took', 'come', 'came', 'see', 'saw', 'look', 'looks', 'looked',
+]);
+
+const QUIZ_GRAMMAR_FORMS = [
+  ['is', 'are', 'was', 'were'],
+  ['have', 'has', 'had', 'having'],
+  ['do', 'does', 'did', 'done'],
+  ['go', 'goes', 'went', 'going'],
+];
+
+function quizHashSeed(text) {
+  let h = 2166136261;
+  for (let i = 0; i < text.length; i += 1) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+function quizRng(episodeId) {
+  let seed = quizHashSeed(`meiju-quiz-v1:${episodeId}`) >>> 0;
+  return function rng() {
+    seed = (seed + 0x6d2b79f5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function quizPick(rng, list, count) {
+  const copy = list.slice();
+  const out = [];
+  while (copy.length && out.length < count) {
+    out.push(copy.splice(Math.floor(rng() * copy.length), 1)[0]);
+  }
+  return out;
+}
+
+function quizShuffle(rng, list) {
+  const out = list.slice();
+  for (let i = out.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(rng() * (i + 1));
+    const tmp = out[i];
+    out[i] = out[j];
+    out[j] = tmp;
+  }
+  return out;
+}
+
+function quizNormPunct(text) {
+  return String(text || '')
+    .replace(/[.!?,;:"“”‘’()\[\]…]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function quizEnWords(text) {
+  const cleaned = quizNormPunct(text);
+  return cleaned ? cleaned.split(' ') : [];
+}
+
+function quizIsContentWord(word) {
+  const lower = word.toLowerCase();
+  return /^[a-z][a-z'-]{2,}$/.test(lower) && !QUIZ_STOPWORDS.has(lower);
+}
+
+function quizEscRe(word) {
+  return word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** Blank the first whole-word occurrence; returns null when it is not present. */
+function quizBlankWord(en, word) {
+  const re = new RegExp(`\\b${quizEscRe(word)}\\b`, 'i');
+  const match = re.exec(en);
+  if (!match) return null;
+  return en.slice(0, match.index) + '____' + en.slice(match.index + match[0].length);
+}
+
+function quizDifficulty(words) {
+  if (words <= 6) return 1;
+  if (words <= 10) return 2;
+  return 3;
+}
+
+/** Unique-by-key helper for option building. */
+function quizUnique(list, keyOf) {
+  const seen = new Set();
+  const out = [];
+  for (const item of list) {
+    const key = keyOf(item);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+  return out;
+}
+
+function buildQuizPool(segments) {
+  const pool = [];
+  for (const seg of segments) {
+    const en = String(seg.en || '').trim();
+    const zh = String(seg.zh || '').trim();
+    if (!en || !zh) continue;
+    const words = quizEnWords(en);
+    if (words.length < 3 || words.length > 26) continue;
+    if (en.length > 130 || zh.length > 80) continue;
+    pool.push({ seg, en, zh, words });
+  }
+  return pool;
+}
+
+function quizDistractors(rng, pool, correctText, targetLength, count, exclude, field) {
+  const key = field === 'zh' ? 'zh' : 'en';
+  const close = [];
+  const rest = [];
+  for (const item of pool) {
+    const text = item[key];
+    if (text === correctText || exclude.has(text)) continue;
+    if (Math.abs(text.length - targetLength) <= Math.max(16, targetLength * 0.6)) close.push(item);
+    else rest.push(item);
+  }
+  const source = close.length >= count ? close : close.concat(rest);
+  return quizUnique(quizPick(rng, source, count * 3), (item) => item[key])
+    .slice(0, count)
+    .map((item) => item[key]);
+}
+
+function quizOptions(rng, correct, distractors) {
+  const options = quizShuffle(rng, [correct].concat(distractors));
+  return { options, answer: options.indexOf(correct) };
+}
+
+/**
+ * Build the selection-only quiz for one episode from its own material.
+ * @param {object} material - parsed material.json
+ * @param {string} episodeId
+ * @returns {{quiz: object, questionCount: number}}
+ */
+function generateQuiz(material, episodeId) {
+  const segments = Array.isArray(material && material.segments) ? material.segments : [];
+  const pool = buildQuizPool(segments);
+  const rng = quizRng(episodeId);
+  const usage = new Map();
+
+  function available(candidate) {
+    return (usage.get(candidate.seg.index) || 0) < 2;
+  }
+
+  function take(predicate) {
+    const candidates = pool.filter((item) => available(item) && (!predicate || predicate(item)));
+    if (!candidates.length) return null;
+    const picked = candidates[Math.floor(rng() * candidates.length)];
+    usage.set(picked.seg.index, (usage.get(picked.seg.index) || 0) + 1);
+    return picked;
+  }
+
+  function buildListening() {
+    const picked = take((item) => item.words.length >= 3);
+    if (!picked) return null;
+    const distractors = quizDistractors(rng, pool, picked.en, picked.en.length, 3, new Set([picked.en]), 'en');
+    if (distractors.length < 3) return null;
+    const { options, answer } = quizOptions(rng, picked.en, distractors);
+    return {
+      type: 'listening',
+      skill: 'listening',
+      difficulty: quizDifficulty(picked.words.length),
+      segmentIndex: picked.seg.index,
+      audio: 'segment',
+      question: '听录音，选出你听到的句子：',
+      options,
+      answer,
+      explanation: `听力原文（第 ${picked.seg.index} 句）：${picked.en}`,
+    };
+  }
+
+  function buildTranslate() {
+    const picked = take((item) => item.words.length >= 4 && item.zh.length >= 5);
+    if (!picked) return null;
+    const distractors = quizDistractors(rng, pool, picked.zh, picked.zh.length, 3, new Set([picked.zh]), 'zh');
+    if (distractors.length < 3) return null;
+    const { options, answer } = quizOptions(rng, picked.zh, distractors);
+    return {
+      type: 'translate',
+      skill: 'idiom',
+      difficulty: quizDifficulty(picked.words.length),
+      segmentIndex: picked.seg.index,
+      question: `选出这句台词最准确的中文意思：「${picked.en}」`,
+      options,
+      answer,
+      explanation: `第 ${picked.seg.index} 句的中文意思：${picked.zh}`,
+    };
+  }
+
+  function buildChoice() {
+    const picked = take((item) => item.words.length >= 3 && item.zh.length >= 5);
+    if (!picked) return null;
+    const distractors = quizDistractors(rng, pool, picked.en, picked.en.length, 3, new Set([picked.en]), 'en');
+    if (distractors.length < 3) return null;
+    const { options, answer } = quizOptions(rng, picked.en, distractors);
+    return {
+      type: 'choice',
+      skill: 'vocab',
+      difficulty: quizDifficulty(picked.words.length),
+      segmentIndex: picked.seg.index,
+      question: `选出与这句中文最对应的英文台词：「${picked.zh}」`,
+      options,
+      answer,
+      explanation: `「${picked.zh}」对应的台词是第 ${picked.seg.index} 句：${picked.en}`,
+    };
+  }
+
+  const wordPool = quizUnique(
+    pool.flatMap((item) => item.words.filter((word) => quizIsContentWord(word) && word.length >= 4)
+      .map((word) => word.toLowerCase())),
+    (word) => word,
+  );
+
+  function buildFill() {
+    if (wordPool.length < 6) return null;
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      const picked = take((item) => item.words.some((word) => quizIsContentWord(word) && word.length >= 4));
+      if (!picked) return null;
+      const candidates = picked.words.filter((word) => quizIsContentWord(word) && word.length >= 4);
+      const word = candidates[Math.floor(rng() * candidates.length)].toLowerCase();
+      const blanked = quizBlankWord(picked.en, word);
+      if (!blanked) continue;
+      const distractors = quizUnique(
+        quizPick(rng, wordPool.filter((candidate) => candidate !== word), 12),
+        (candidate) => candidate,
+      ).slice(0, 3);
+      if (distractors.length < 3) return null;
+      const { options, answer } = quizOptions(rng, word, distractors);
+      return {
+        type: 'fill',
+        skill: 'vocab',
+        difficulty: quizDifficulty(picked.words.length),
+        segmentIndex: picked.seg.index,
+        question: `选词填空（第 ${picked.seg.index} 句）：${blanked}`,
+        options,
+        answer,
+        explanation: `完整句子：${picked.en}（这里需要 “${word}”）。`,
+      };
+    }
+    return null;
+  }
+
+  function buildGrammar() {
+    for (const formSet of QUIZ_GRAMMAR_FORMS) {
+      for (const form of formSet) {
+        const re = new RegExp(`\\b${form}\\b`, 'i');
+        const picked = take((item) => re.test(item.en));
+        if (!picked) continue;
+        const lower = picked.en.toLowerCase();
+        const at = lower.search(re);
+        if (at < 0) continue;
+        const matched = picked.en.slice(at, at + form.length);
+        const blanked = `${picked.en.slice(0, at)}____${picked.en.slice(at + form.length)}`;
+        const { options, answer } = quizOptions(rng, matched.toLowerCase(), quizShuffle(rng, formSet.filter((item) => item !== form)).slice(0, 3));
+        return {
+          type: 'grammar',
+          skill: 'grammar',
+          difficulty: quizDifficulty(picked.words.length),
+          segmentIndex: picked.seg.index,
+          question: `语法题 · 选词填空（第 ${picked.seg.index} 句）：${blanked}`,
+          options: options.map((option) => option.toLowerCase()),
+          answer,
+          explanation: `第 ${picked.seg.index} 句：${picked.en}。这里需要用 “${matched.toLowerCase()}”。`,
+        };
+      }
+    }
+    return null;
+  }
+
+  function buildMulti() {
+    // A content word that appears in 2-5 different lines: tick every line that contains it.
+    const byWord = new Map();
+    for (const item of pool) {
+      const seen = new Set();
+      for (const word of item.words) {
+        const lower = word.toLowerCase();
+        if (!quizIsContentWord(lower) || lower.length < 4 || seen.has(lower)) continue;
+        seen.add(lower);
+        const list = byWord.get(lower) || [];
+        list.push(item);
+        byWord.set(lower, list);
+      }
+    }
+    const candidates = [...byWord.entries()].filter(([, list]) => list.length >= 2 && list.length <= 5);
+    if (!candidates.length) return null;
+    const [word, containing] = candidates[Math.floor(rng() * candidates.length)];
+    const positive = quizUnique(quizPick(rng, containing, 2), (item) => item.en);
+    if (positive.length < 2) return null;
+    const negativePool = pool.filter((item) => !containing.includes(item) && !new RegExp(`\\b${quizEscRe(word)}\\b`, 'i').test(item.en));
+    const negative = quizUnique(quizPick(rng, negativePool, 2), (item) => item.en);
+    if (negative.length < 2) return null;
+    const options = quizShuffle(rng, positive.map((item) => item.en).concat(negative.map((item) => item.en)));
+    const answers = [];
+    for (let i = 0; i < options.length; i += 1) {
+      if (positive.some((item) => item.en === options[i])) answers.push(i);
+    }
+    if (answers.length < 2) return null;
+    return {
+      type: 'multi',
+      skill: 'vocab',
+      difficulty: 2,
+      segmentIndex: positive[0].seg.index,
+      question: `勾选所有包含「${word}」的台词（多选）：`,
+      options,
+      answers,
+      explanation: `「${word}」出现在 ${containing.length} 句台词里，例如：${positive.map((item) => item.en).join(' / ')}`,
+    };
+  }
+
+  const plan = [
+    ['listening', 4], ['translate', 4], ['choice', 3], ['fill', 4], ['grammar', 3], ['multi', 2],
+  ];
+  const builders = {
+    listening: buildListening,
+    translate: buildTranslate,
+    choice: buildChoice,
+    fill: buildFill,
+    grammar: buildGrammar,
+    multi: buildMulti,
+  };
+
+  const questions = [];
+  for (const [type, wanted] of plan) {
+    for (let i = 0; i < wanted; i += 1) {
+      const question = builders[type]();
+      if (!question) break;
+      questions.push(question);
+      if (questions.length >= QUIZ_MAX_QUESTIONS) break;
+    }
+    if (questions.length >= QUIZ_MAX_QUESTIONS) break;
+  }
+
+  const shuffled = quizShuffle(rng, questions).map((question, i) => ({
+    id: `q${String(i + 1).padStart(2, '0')}`,
+    ...question,
+  }));
+
+  const quiz = {
+    episodeId,
+    passScore: 100,
+    version: 2,
+    generator: 'auto-v1',
+    generatedAt: new Date().toISOString(),
+    questions: shuffled,
+  };
+  return { quiz, questionCount: shuffled.length };
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help) {
@@ -864,17 +1303,38 @@ async function main() {
     throw new Error(`invalid --episode id "${episodeId}" (letters, digits, dot, dash, underscore only)`);
   }
 
-  const videoFile = requireFile(args.video, 'video');
-  const subtitleFile = requireFile(args.subtitle, 'subtitle');
   if (!args.data) throw new Error(`missing required option --data\n${USAGE}`);
 
   const dataDir = path.resolve(String(args.data));
   const episodeDir = path.join(dataDir, 'episodes', episodeId);
+  const materialFile = path.join(episodeDir, 'material.json');
+  const quizFile = path.join(episodeDir, 'quiz.json');
+
+  if (args.quizOnly) {
+    if (!fs.existsSync(materialFile)) {
+      throw new Error(`--quiz-only needs an existing material.json: ${materialFile}`);
+    }
+    const existing = JSON.parse(fs.readFileSync(materialFile, 'utf8'));
+    const segmentCount = Array.isArray(existing.segments) ? existing.segments.length : 0;
+    progress('quiz', 30, `generating quiz.json for ${episodeId} from ${segmentCount} segment(s)`);
+    const generated = generateQuiz(existing, episodeId);
+    if (!generated.questionCount) throw new Error('quiz generation produced no questions');
+    writeFileAtomic(quizFile, JSON.stringify(generated.quiz, null, 2) + '\n');
+    progress('quiz', 90, `quiz.json written: ${quizFile} (${generated.questionCount} questions)`);
+    emitJson({
+      stage: 'done',
+      pct: 100,
+      result: { episodeId, quizFile, questionCount: generated.questionCount },
+    });
+    return;
+  }
+
+  const videoFile = requireFile(args.video, 'video');
+  const subtitleFile = requireFile(args.subtitle, 'subtitle');
   const assetsDir = path.join(episodeDir, 'assets');
   const clipsDir = path.join(assetsDir, 'clips');
   ensureDir(clipsDir);
 
-  const materialFile = path.join(episodeDir, 'material.json');
   const videoOut = path.join(assetsDir, 'video.mp4');
   const audioOut = path.join(assetsDir, 'full.mp3');
 
@@ -1160,6 +1620,27 @@ async function main() {
   writeFileAtomic(materialFile, JSON.stringify(material, null, 2) + '\n');
   progress('material', 98, `material.json written: ${materialFile}`);
 
+  // -- quiz.json (auto-generated from this episode's own segments) -----------
+  let quizQuestionCount = 0;
+  try {
+    if (force || !fs.existsSync(quizFile)) {
+      progress('quiz', 98, 'generating quiz.json from this episode…');
+      const generated = generateQuiz(material, episodeId);
+      if (generated.questionCount > 0) {
+        writeFileAtomic(quizFile, JSON.stringify(generated.quiz, null, 2) + '\n');
+        quizQuestionCount = generated.questionCount;
+        progress('quiz', 99, `quiz.json written: ${quizFile} (${quizQuestionCount} questions)`);
+      } else {
+        progress('quiz', 99, 'quiz generation produced no questions (episode too short?) — skipped');
+      }
+    } else {
+      progress('quiz', 99, `quiz.json already exists (kept): ${quizFile}`);
+    }
+  } catch (error) {
+    const message = error && error.message ? error.message : String(error);
+    progress('quiz', 99, `quiz generation failed (material kept): ${message}`);
+  }
+
   emitJson({
     stage: 'done',
     pct: 100,
@@ -1168,6 +1649,8 @@ async function main() {
       materialFile,
       segmentCount: segments.length,
       clipCount,
+      quizFile: quizQuestionCount ? quizFile : null,
+      questionCount: quizQuestionCount,
     },
   });
 }
