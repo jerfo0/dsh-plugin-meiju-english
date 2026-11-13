@@ -150,6 +150,7 @@ const USAGE = [
   '       [--title-en "..."] [--title-zh "..."] [--force]',
   '       [--theme-gap-min <seconds>] [--season <n>] [--number <n>]',
   '       [--quiz-only]   (only (re)generate quiz.json from an existing material.json)',
+  '       [--skip-quiz]   (material only; the Host generates the quiz with the model)',
   '',
   'Builds data/episodes/<id>/{assets/video.mp4,assets/full.mp3,assets/clips/segNNNN.mp3,material.json,quiz.json}.',
   'quiz.json is generated automatically when missing (or regenerated with --force / --quiz-only).',
@@ -169,6 +170,7 @@ function parseArgs(argv) {
     themeGapMin: null,
     force: false,
     quizOnly: false,
+    skipQuiz: false,
     help: false,
   };
 
@@ -205,6 +207,11 @@ function parseArgs(argv) {
     if (key === 'quiz-only') {
       if (value !== undefined) throw new Error('option --quiz-only does not take a value');
       out.quizOnly = true;
+      continue;
+    }
+    if (key === 'skip-quiz') {
+      if (value !== undefined) throw new Error('option --skip-quiz does not take a value');
+      out.skipQuiz = true;
       continue;
     }
     if (key === 'help' || key === 'h') {
@@ -1211,28 +1218,18 @@ function generateQuiz(material, episodeId) {
     return null;
   }
 
+  const PRESENT_PERFECT_RE = /\b(have|has)\s+(been|gone|done|made|seen|had|known|told|said|gotten|got|taken|come|become|felt|kept|left|lost|met|paid|put|read|run|sent|set|shown|spoken|spent|stood|thought|understood|won|written|[a-z]+ed)\b/i;
+
   function buildMulti() {
-    // A content word that appears in 2-5 different lines: tick every line that contains it.
-    const byWord = new Map();
-    for (const item of pool) {
-      const seen = new Set();
-      for (const word of item.words) {
-        const lower = word.toLowerCase();
-        if (!quizIsContentWord(lower) || lower.length < 4 || seen.has(lower)) continue;
-        seen.add(lower);
-        const list = byWord.get(lower) || [];
-        list.push(item);
-        byWord.set(lower, list);
-      }
-    }
-    const candidates = [...byWord.entries()].filter(([, list]) => list.length >= 2 && list.length <= 5);
-    if (!candidates.length) return null;
-    const [word, containing] = candidates[Math.floor(rng() * candidates.length)];
-    const positive = quizUnique(quizPick(rng, containing, 2), (item) => item.en);
-    if (positive.length < 2) return null;
-    const negativePool = pool.filter((item) => !containing.includes(item) && !new RegExp(`\\b${quizEscRe(word)}\\b`, 'i').test(item.en));
-    const negative = quizUnique(quizPick(rng, negativePool, 2), (item) => item.en);
-    if (negative.length < 2) return null;
+    // Grammar recognition instead of word spotting: tick the lines that use the
+    // present perfect (have/has + past participle).
+    const perfect = pool.filter((item) => PRESENT_PERFECT_RE.test(item.en));
+    if (perfect.length < 2) return null;
+    const plain = pool.filter((item) => !PRESENT_PERFECT_RE.test(item.en));
+    if (plain.length < 2) return null;
+    const positive = quizUnique(quizPick(rng, perfect, 2), (item) => item.en);
+    const negative = quizUnique(quizPick(rng, plain, 2), (item) => item.en);
+    if (positive.length < 2 || negative.length < 2) return null;
     const options = quizShuffle(rng, positive.map((item) => item.en).concat(negative.map((item) => item.en)));
     const answers = [];
     for (let i = 0; i < options.length; i += 1) {
@@ -1241,13 +1238,13 @@ function generateQuiz(material, episodeId) {
     if (answers.length < 2) return null;
     return {
       type: 'multi',
-      skill: 'vocab',
+      skill: 'grammar',
       difficulty: 2,
       segmentIndex: positive[0].seg.index,
-      question: `勾选所有包含「${word}」的台词（多选）：`,
+      question: '勾选所有使用现在完成时（have/has + 过去分词）的台词（多选）：',
       options,
       answers,
-      explanation: `「${word}」出现在 ${containing.length} 句台词里，例如：${positive.map((item) => item.en).join(' / ')}`,
+      explanation: `现在完成时表示过去发生、与现在有关的动作。使用它的台词包括：${positive.map((item) => item.en).join(' / ')}`,
     };
   }
 
@@ -1623,7 +1620,9 @@ async function main() {
   // -- quiz.json (auto-generated from this episode's own segments) -----------
   let quizQuestionCount = 0;
   try {
-    if (force || !fs.existsSync(quizFile)) {
+    if (args.skipQuiz) {
+      progress('quiz', 99, 'quiz generation skipped (host generates it with the model)');
+    } else if (force || !fs.existsSync(quizFile)) {
       progress('quiz', 98, 'generating quiz.json from this episode…');
       const generated = generateQuiz(material, episodeId);
       if (generated.questionCount > 0) {

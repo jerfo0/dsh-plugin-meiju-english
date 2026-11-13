@@ -181,6 +181,9 @@ const state = {
   // Optional Host speechToText service; bound lazily in its own inject scope and
   // only ever read through route handlers (never via ctx.speechToText).
   stt: null,
+  // Optional Host model services used to author the quiz like an English teacher.
+  llm: null,
+  agentDefaultModel: null,
 };
 
 const CASE_INSENSITIVE_FS = process.platform === 'win32' || process.platform === 'darwin';
@@ -828,6 +831,9 @@ function handleProgressLine(job, line) {
       typeof message.error === 'string' ? message.error.slice(0, 2000) : textMessage || '生成失败';
   }
   if (stage) {
+    // The builder's final "done" line must not jump the panel to 100%, because
+    // the Host still generates the quiz afterwards. Keep the result only.
+    if (stage === 'done') return;
     job.progress = {
       stage,
       pct: pct === null ? (job.progress && Number.isFinite(job.progress.pct) ? job.progress.pct : 0) : pct,
@@ -839,6 +845,431 @@ function handleProgressLine(job, line) {
       pct,
       message: textMessage || job.progress.message,
     };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// AI quiz authoring: the Host asks the configured model to act as an English
+// teacher and write a pedagogically meaningful quiz from this episode's own
+// bilingual lines. Falls back to the rule-based builder quiz when unavailable.
+// ---------------------------------------------------------------------------
+
+const QUIZ_TYPES = new Set(['choice', 'multi', 'fill', 'grammar', 'translate', 'listening']);
+const QUIZ_SKILLS = new Set(['vocab', 'grammar', 'idiom', 'slang', 'listening', 'pragmatics', 'translation']);
+
+function writeFileAtomicJson(file, value) {
+  const tmp = `${file}.tmp-${process.pid}-${Date.now()}`;
+  fs.writeFileSync(tmp, JSON.stringify(value, null, 2) + '\n', 'utf8');
+  try {
+    fs.renameSync(tmp, file);
+  } catch (error) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      /* ignore */
+    }
+    throw error;
+  }
+}
+
+function pickLlmSelection() {
+  try {
+    const model = state.agentDefaultModel;
+    if (model && typeof model.currentSelection === 'function') {
+      const selection = model.currentSelection();
+      if (isPlainObject(selection) && typeof selection.provider === 'string' && typeof selection.model === 'string') {
+        return { provider: selection.provider, model: selection.model };
+      }
+    }
+  } catch {
+    /* fall through to the provider roster */
+  }
+  return null;
+}
+
+async function callLlmText({ system, user, maxTokens, signal }) {
+  const llm = state.llm;
+  if (!llm || typeof llm.stream !== 'function') throw new Error('当前 Host 没有可用的模型服务（llm）');
+  const selection = pickLlmSelection();
+  if (!selection) throw new Error('当前 Host 没有配置默认模型（agentDefaultModel）');
+  diag(`quiz: llm request provider=${selection.provider} model=${selection.model} promptChars=${user.length}`);
+  let text = '';
+  let finish = null;
+  const stream = llm.stream({
+    provider: selection.provider,
+    model: selection.model,
+    system,
+    messages: [{ role: 'user', content: [{ type: 'text', text: user }] }],
+    temperature: 0.7,
+    maxTokens: maxTokens || 8000,
+    signal,
+  });
+  for await (const chunk of stream) {
+    if (!isPlainObject(chunk)) continue;
+    if (chunk.type === 'text-delta' && typeof chunk.text === 'string') text += chunk.text;
+    else if (chunk.type === 'finish') finish = chunk.reason;
+  }
+  if (finish && finish.kind === 'error') {
+    throw new Error(`模型调用失败：${(finish.failure && finish.failure.message) || 'unknown'}`);
+  }
+  if (finish && finish.kind === 'aborted') throw new Error('模型调用被取消或超时');
+  if (finish && finish.kind === 'max-tokens') throw new Error('模型输出被截断（max tokens）');
+  if (!text.trim()) throw new Error('模型没有返回内容');
+  return { text, provider: selection.provider, model: selection.model };
+}
+
+function quizWordCount(text) {
+  return String(text || '')
+    .replace(/[.!?,;:"“”‘’()\[\]…]/g, ' ')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean).length;
+}
+
+/** Sample the episode's dialogue so the prompt stays inside a reasonable size. */
+function sampleQuizLines(segments, limit) {
+  const usable = segments.filter((segment) => segment && segment.en && segment.zh);
+  const max = Number.isFinite(limit) ? limit : 110;
+  if (usable.length <= max) return usable.slice();
+  const picked = [];
+  const step = (usable.length - 1) / (max - 1);
+  for (let i = 0; i < max; i += 1) picked.push(usable[Math.round(i * step)]);
+  return picked;
+}
+
+const QUIZ_JSON_TEMPLATE = `{
+  "questions": [
+    {
+      "type": "choice|multi|fill|grammar|translate|listening",
+      "skill": "vocab|grammar|idiom|slang|listening|pragmatics|translation",
+      "difficulty": 1,
+      "segmentIndex": 12,
+      "question": "中文题干（可以引用英文台词）",
+      "options": ["选项1", "选项2", "选项3", "选项4"],
+      "answer": 0,
+      "answers": [0, 2],
+      "explanation": "中文解析：为什么这个答案对，以及对应的语言点"
+    }
+  ]
+}`;
+
+const QUIZ_BATCH_PLANS = {
+  A: [
+    '生词/词组理解 4 题（type=choice）：从台词中挑出值得学的单词或短语，问它在语境中的意思；选项用 4 个中文释义，干扰项要同词性、语义相近，不能一眼排除。',
+    '语法 4 题（type=fill 或 grammar）：针对时态、语态、从句、非谓语、主谓一致、疑问句语序等真实出现过的结构；fill 题题干用 ____ 挖空并给 4 个候选词，grammar 题给 4 个句子/形式选正确的。',
+    '俚语/地道表达 2 题（type=choice）：选择台词中的俚语、固定搭配，问它的真实含义。',
+  ],
+  B: [
+    '翻译 3 题（type=translate）：选一句台词，问最准确的中文翻译；4 个中文选项，干扰项要保留一半正确信息、另一半有细微偏差（时态、否定、程度、指代）。',
+    '语用/语气 3 题（type=choice）：问说话人真实态度（讽刺/敷衍/安慰/试探等），4 个中文选项。',
+  ],
+  C: [
+    '综合理解/多选 3 题（type=multi）：勾选所有正确项（4-5 个选项、2-3 个正确），考剧情理解、词义辨析或语用判断；三题分别侧重剧情、词义、语用。',
+  ],
+};
+
+function buildQuizPrompt(episode, material, batch) {
+  const lines = sampleQuizLines(material.segments, 110)
+    .map((segment) => `[${segment.index}] 英: ${segment.en}\n     中: ${segment.zh}`)
+    .join('\n');
+  const title = [episode.titleEn, episode.titleZh].filter(Boolean).join(' / ') || episode.episodeId;
+  const plan = QUIZ_BATCH_PLANS[batch] || QUIZ_BATCH_PLANS.A;
+  const order = { A: '一', B: '二', C: '三' }[batch] || '一';
+  return [
+    `请为一集美剧（${title}）设计英语学习测试题：这是整套题的第 ${order} 批（共 3 批），学生水平约为中级（CEFR B1-B2）。`,
+    '',
+    '【出题目标】像一位有经验的英语老师，检测学生是否真的理解了这一集的英语，并帮助他们掌握可迁移的语言点。禁止出机械检索题。',
+    '',
+    '【本批必须覆盖的维度与数量】',
+    ...plan,
+    '',
+    '【硬性要求】',
+    '- 只输出一个 JSON 对象，不要 markdown 代码块，不要额外解释。结构：' + QUIZ_JSON_TEMPLATE,
+    '- 每题必须有 segmentIndex，且必须来自下面给出的台词编号；听力题的 segmentIndex 就是被播放的那句。',
+    '- 单选题用 "answer": 数字；多选题用 "answers": [数字,...]（2-3 项正确）；单选题 4 个选项，多选 4-5 个选项。',
+    '- 禁止出「下面哪句包含某个单词」这类关键词检索题；禁止题干直接给出答案；禁止选项明显荒谬或与题干无关。',
+    '- 每题 explanation 用中文写清语言点，**控制在 45 字以内**，不要重复题干、不要长篇解释。',
+    '- difficulty 取 1-3（1 简单、3 较难），本批难度要有梯度。',
+    '',
+    '【本集台词（编号 英 / 中）】',
+    lines,
+  ].join('\n');
+}
+
+function parseQuizJson(text) {
+  let cleaned = String(text || '').trim();
+  cleaned = cleaned.replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim();
+  const start = cleaned.indexOf('{');
+  const end = cleaned.lastIndexOf('}');
+  if (start < 0 || end <= start) throw new Error('模型输出里没有 JSON 对象');
+  const candidate = cleaned.slice(start, end + 1);
+  let parsed;
+  try {
+    parsed = JSON.parse(candidate);
+  } catch (error) {
+    throw new Error(`模型输出的 JSON 无法解析：${(error && error.message) || error}`);
+  }
+  return parsed;
+}
+
+function sanitizeLlmQuiz(parsed, material) {
+  const segments = Array.isArray(material && material.segments) ? material.segments : [];
+  const rawQuestions = parsed && Array.isArray(parsed.questions) ? parsed.questions : [];
+  if (!rawQuestions.length) throw new Error('模型没有返回 questions 数组');
+  const questions = [];
+  const seenQuestions = new Set();
+  for (const raw of rawQuestions) {
+    if (!isPlainObject(raw)) continue;
+    const type = typeof raw.type === 'string' ? raw.type.trim() : '';
+    if (!QUIZ_TYPES.has(type)) continue;
+    const segmentIndex = Number(raw.segmentIndex);
+    if (!Number.isInteger(segmentIndex) || segmentIndex < 1 || segmentIndex > segments.length) continue;
+    const segment = segments[segmentIndex - 1];
+    const question = typeof raw.question === 'string' ? raw.question.trim() : '';
+    const explanation = typeof raw.explanation === 'string' ? raw.explanation.trim() : '';
+    if (!question || question.length > 400 || explanation.length < 10) continue;
+    if (type === 'fill' && !/_{2,}/.test(question)) continue;
+    const options = Array.isArray(raw.options)
+      ? raw.options.map((option) => (typeof option === 'string' ? option.trim() : '')).filter(Boolean)
+      : [];
+    if (options.length < 3) continue;
+    if (new Set(options).size !== options.length) continue;
+    if (type === 'multi') {
+      const answers = Array.isArray(raw.answers)
+        ? [...new Set(raw.answers.map((value) => Number(value)).filter((value) => Number.isInteger(value) && value >= 0 && value < options.length))].sort((a, b) => a - b)
+        : [];
+      if (answers.length < 2) continue;
+      const skill = QUIZ_SKILLS.has(raw.skill) ? raw.skill : 'pragmatics';
+      const difficulty = clamp(Math.round(Number(raw.difficulty) || 2), 1, 3);
+      const key = `${question}`;
+      if (seenQuestions.has(key)) continue;
+      seenQuestions.add(key);
+      questions.push({ type, skill, difficulty, segmentIndex, question, options, answers, explanation });
+      continue;
+    }
+    let answer = Number(raw.answer);
+    if (!Number.isInteger(answer) || answer < 0 || answer >= options.length) continue;
+    if (type === 'listening') {
+      // A one-word line ("Ross.") cannot train listening comprehension.
+      const words = quizWordCount(segment && segment.en);
+      if (words < 5) continue;
+    }
+    if (type === 'listening' && segment && typeof segment.en === 'string' && segment.en.trim()) {
+      // The played clip must be the sentence the learner selects: pin it exactly.
+      options[answer] = segment.en.trim();
+      if (new Set(options).size !== options.length) continue;
+    }
+    const skill = QUIZ_SKILLS.has(raw.skill) ? raw.skill : (type === 'listening' ? 'listening' : 'vocab');
+    const difficulty = clamp(Math.round(Number(raw.difficulty) || 2), 1, 3);
+    const key = `${question}`;
+    if (seenQuestions.has(key)) continue;
+    seenQuestions.add(key);
+    questions.push({ type, skill, difficulty, segmentIndex, question, options, answer, explanation });
+  }
+  if (!questions.length) {
+    throw new Error('模型没有返回可用的题目');
+  }
+  return questions.slice(0, 24);
+}
+
+const QUIZ_MIN_QUESTIONS = 12;
+
+/**
+ * Listening questions are generated deterministically instead of by the model:
+ * pick complete sentences, use other real lines as distractors, rotate the
+ * answer position. This guarantees the listening dimension every time.
+ */
+function buildListeningQuestions(material, count) {
+  const segments = Array.isArray(material && material.segments) ? material.segments : [];
+  const eligible = segments.filter((segment) => segment && typeof segment.en === 'string' && quizWordCount(segment.en) >= 6);
+  if (eligible.length < 8) return [];
+  const wanted = Math.min(count || 4, eligible.length - 3, 6);
+  const picks = [];
+  for (let i = 0; i < wanted; i += 1) {
+    const at = Math.floor(((i + 1) * eligible.length) / (wanted + 1));
+    const segment = eligible[at];
+    if (segment && !picks.some((item) => item.segmentIndex === segment.index)) picks.push(segment);
+  }
+  const questions = [];
+  for (let i = 0; i < picks.length; i += 1) {
+    const segment = picks[i];
+    const correct = segment.en.trim();
+    const correctWords = quizWordCount(correct);
+    const candidates = eligible
+      .filter((item) => item.index !== segment.index && item.en.trim() !== correct)
+      .sort((left, right) => Math.abs(quizWordCount(left.en) - correctWords) - Math.abs(quizWordCount(right.en) - correctWords));
+    const distractors = [];
+    for (let offset = 0; offset < candidates.length && distractors.length < 3; offset += 1) {
+      const candidate = candidates[(i * 3 + offset) % candidates.length];
+      const text = candidate.en.trim();
+      if (text === correct || distractors.includes(text)) continue;
+      distractors.push(text);
+    }
+    if (distractors.length < 3) continue;
+    const base = [correct, ...distractors];
+    const rotation = i % 4;
+    const options = base.slice(rotation).concat(base.slice(0, rotation));
+    questions.push({
+      type: 'listening',
+      skill: 'listening',
+      difficulty: clamp(correctWords <= 7 ? 1 : correctWords <= 12 ? 2 : 3, 1, 3),
+      segmentIndex: segment.index,
+      audio: 'segment',
+      question: `请听第 ${segment.index} 句的录音，选出你听到的完整台词：`,
+      options,
+      answer: (4 - rotation) % 4,
+      explanation: `听力原文（第 ${segment.index} 句）：${correct}`,
+    });
+  }
+  return questions;
+}
+
+async function generateQuizWithLlm(material, episode) {
+  const system = '你是一位资深英语老师，擅长根据美剧台词设计精读与听力测试题。你只输出一个合法 JSON 对象，不输出 markdown 或任何解释文字。';
+  const batches = ['A', 'B', 'C'];
+  const collected = [];
+  const errors = [];
+  let usedModel = '';
+  for (const batch of batches) {
+    let batchOk = false;
+    for (let attempt = 0; attempt < 2 && !batchOk; attempt += 1) {
+      const basePrompt = buildQuizPrompt(episode, material, batch);
+      const user = attempt === 0
+        ? basePrompt
+        : `${basePrompt}\n\n【上一次输出的问题】\n${String(errors[errors.length - 1] || '').slice(0, 500)}\n请把解析写短，只输出完整 JSON。`;
+      try {
+        const call = await callLlmText({
+          system,
+          user,
+          maxTokens: 8192,
+          signal: AbortSignal.timeout(150000),
+        });
+        if (!usedModel) usedModel = `${call.provider}/${call.model}`;
+        const parsed = parseQuizJson(call.text);
+        const questions = sanitizeLlmQuiz(parsed, material);
+        collected.push(...questions);
+        batchOk = true;
+        diag(`quiz: batch ${batch} produced ${questions.length} questions`);
+      } catch (error) {
+        const message = (error && error.message) || String(error);
+        errors.push(message);
+        diag(`quiz: batch ${batch} attempt ${attempt + 1} rejected: ${message}`);
+      }
+    }
+  }
+  if (collected.length < QUIZ_MIN_QUESTIONS) {
+    throw new Error(`AI 出题失败：有效题目只有 ${collected.length} 道${errors.length ? `（${errors[0]}）` : ''}`);
+  }
+  // Listening is mechanical and must always be present: build it locally.
+  const listening = buildListeningQuestions(material, 4);
+  const merged = collected.concat(listening);
+  // De-duplicate by question + segment, then assign ids.
+  const seen = new Set();
+  const unique = [];
+  for (const question of merged) {
+    const key = `${question.segmentIndex}|${question.question}|${(question.options && question.options[0]) || ''}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(question);
+  }
+  const questions = unique.slice(0, 24).map((question, index) => ({
+    id: `q${String(index + 1).padStart(2, '0')}`,
+    ...question,
+  }));
+  if (questions.length < QUIZ_MIN_QUESTIONS) {
+    throw new Error(`AI 出题失败：去重后只有 ${questions.length} 道有效题目`);
+  }
+  return {
+    quiz: {
+      episodeId: episode.episodeId,
+      passScore: 100,
+      version: 2,
+      generator: 'llm-v1',
+      generatorModel: usedModel || 'host-default',
+      generatedAt: new Date().toISOString(),
+      questions,
+    },
+    questionCount: questions.length,
+  };
+}
+
+/** Spawn the builder's rule-based quiz-only mode as a fallback and wait for it. */
+function runBuilderQuiz(episode) {
+  return new Promise((resolve, reject) => {
+    const args = [BUILDER_SCRIPT, '--episode', episode.episodeId, '--data', state.dataRoot, '--quiz-only'];
+    let child;
+    try {
+      child = spawn(nodeExecutable(), args, {
+        cwd: ROOT,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+        env: { ...process.env },
+      });
+    } catch (error) {
+      reject(new Error(`无法启动题库生成进程：${(error && error.message) || error}`));
+      return;
+    }
+    let stderrTail = '';
+    if (child.stdout) {
+      child.stdout.setEncoding('utf8');
+      child.stdout.on('data', () => { /* progress lines are not needed here */ });
+      child.stdout.on('error', () => { /* ignore */ });
+    }
+    if (child.stderr) {
+      child.stderr.setEncoding('utf8');
+      child.stderr.on('data', (chunk) => { stderrTail = appendTail(stderrTail, chunk, 4000); });
+      child.stderr.on('error', () => { /* ignore */ });
+    }
+    child.on('error', (error) => reject(new Error(`题库生成进程启动失败：${(error && error.message) || error}`)));
+    child.on('close', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(lastMeaningfulLine(stderrTail) || `题库生成进程退出码 ${code}`));
+    });
+  });
+}
+
+/**
+ * Generate quiz.json for one episode: the model writes a teacher-quality quiz;
+ * when the model is unavailable or its output is unusable, the deterministic
+ * rule-based quiz is used instead. Never throws for a missing model.
+ */
+async function runQuizFlow(job, episode) {
+  const quizFile = path.join(episodeDir(episode.episodeId), 'quiz.json');
+  let material = null;
+  try {
+    material = readJsonCached(path.join(episodeDir(episode.episodeId), 'material.json'));
+  } catch {
+    material = null;
+  }
+  if (!isPlainObject(material) || !Array.isArray(material.segments) || !material.segments.length) {
+    throw new Error('本集还没有物料，无法生成测试题');
+  }
+
+  job.episodeId = episode.episodeId;
+  job.progress = { stage: 'quiz', pct: 97, message: '正在用 AI 生成测试题（像英语老师一样出题）…' };
+  try {
+    const generated = await generateQuizWithLlm(material, episode);
+    writeFileAtomicJson(quizFile, generated.quiz);
+    job.result = { ...(job.result || {}), quizFile, questionCount: generated.questionCount };
+    job.progress = {
+      stage: 'quiz',
+      pct: 99,
+      message: `测试题已生成：${generated.questionCount} 道（AI 出题，共 6 个维度）`,
+    };
+    diag(`quiz: llm wrote ${generated.questionCount} questions for ${episode.episodeId}`);
+    return { generator: 'llm', questionCount: generated.questionCount };
+  } catch (error) {
+    const message = (error && error.message) || String(error);
+    diag(`quiz: llm failed for ${episode.episodeId}: ${message}`);
+    if (isFile(quizFile)) {
+      job.progress = { stage: 'quiz', pct: 99, message: 'AI 出题不可用，沿用本地规则题库' };
+      return { generator: 'fallback-existing' };
+    }
+    job.progress = { stage: 'quiz', pct: 98, message: 'AI 出题不可用，改用本地规则题库…' };
+    await runBuilderQuiz(episode);
+    job.result = { ...(job.result || {}), quizFile };
+    job.progress = { stage: 'quiz', pct: 99, message: '已用本地规则题库生成测试题' };
+    return { generator: 'fallback-builder' };
   }
 }
 
@@ -883,24 +1314,31 @@ function startGenerate(episode, mode) {
   state.jobs.set(job.id, job);
   state.episodeJobs.set(episode.episodeId, job.id);
 
-  const args = quizOnly
-    ? [BUILDER_SCRIPT, '--episode', episode.episodeId, '--data', state.dataRoot, '--quiz-only']
-    : [
-      BUILDER_SCRIPT,
-      '--episode',
-      episode.episodeId,
-      '--video',
-      episode.video,
-      '--subtitle',
-      episode.subtitle,
-      '--data',
-      state.dataRoot,
-    ];
-  if (!quizOnly) {
-    if (episode.titleEn) args.push('--title-en', episode.titleEn);
-    if (episode.titleZh) args.push('--title-zh', episode.titleZh);
-    if (episode.force === true) args.push('--force');
+  // Quiz-only runs entirely in the Host (the model writes it); no child needed.
+  if (quizOnly) {
+    void runQuizFlow(job, episode)
+      .then(() => finishJob(job, 'done', null))
+      .catch((error) => finishJob(job, 'error', (error && error.message) || String(error)));
+    return { jobId: job.id, reused: false };
   }
+
+  const args = [
+    BUILDER_SCRIPT,
+    '--episode',
+    episode.episodeId,
+    '--video',
+    episode.video,
+    '--subtitle',
+    episode.subtitle,
+    '--data',
+    state.dataRoot,
+  ];
+  if (episode.titleEn) args.push('--title-en', episode.titleEn);
+  if (episode.titleZh) args.push('--title-zh', episode.titleZh);
+  if (episode.force === true) args.push('--force');
+  // The Host authors the quiz with the model after the material is built; the
+  // builder's deterministic quiz stays available as the fallback path.
+  args.push('--skip-quiz');
 
   let child;
   try {
@@ -947,7 +1385,10 @@ function startGenerate(episode, mode) {
     job.child = null;
     if (job.status !== 'running') return;
     if (code === 0 && !job.failure) {
-      finishJob(job, 'done', null);
+      // Material is on disk: author the quiz with the model, then settle.
+      void runQuizFlow(job, episode)
+        .then(() => finishJob(job, 'done', null))
+        .catch((error) => finishJob(job, 'error', (error && error.message) || String(error)));
       return;
     }
     const reason =
@@ -1439,6 +1880,10 @@ async function lanRequest(req, res) {
       await lanSttRequest(req, res, pathname);
       return;
     }
+    if (pathname === '/quiz') {
+      await lanQuizRequest(req, res);
+      return;
+    }
 
     const method = String(req.method || 'GET').toUpperCase();
     if (method !== 'GET' && method !== 'HEAD') {
@@ -1803,8 +2248,7 @@ function lanSttLoopbackOnly(req) {
  * The LAN twin of the three speech routes: same handlers, same JSON envelopes,
  * but reachable only from this machine (the phone page must not use it).
  */
-async function lanSttRequest(req, res, pathname) {
-  const method = String(req.method || 'GET').toUpperCase();
+async function lanSttRequest(req, res, pathname) {  const method = String(req.method || 'GET').toUpperCase();
   if (!lanSttLoopbackOnly(req)) {
     const address = String((req.socket && req.socket.remoteAddress) || '');
     diag(`lan-stt: rejected non-loopback ${address} ${pathname}`);
@@ -1841,6 +2285,46 @@ async function lanSttRequest(req, res, pathname) {
     if (error && error.phase !== undefined) payload.phase = error.phase;
     diag(`lan-stt: ${pathname} -> ${status} ${String(payload.code || '')} ${message}`);
     writeJson(res, status, payload, false);
+  }
+}
+
+// Loopback-only diagnostic route: author quiz.json for one episode with the
+// model and report the result. Used to verify the AI authoring path locally.
+async function lanQuizRequest(req, res) {
+  const method = String(req.method || 'GET').toUpperCase();
+  if (!lanSttLoopbackOnly(req)) {
+    writeJson(res, 403, { ok: false, code: 'quiz-forbidden', error: '仅允许本机访问' }, method === 'HEAD');
+    return;
+  }
+  if (method !== 'POST') {
+    writeJson(res, 405, { ok: false, code: 'quiz-method', error: '该接口只支持 POST' }, false);
+    return;
+  }
+  try {
+    const body = await readJsonBody(req, BODY_LIMIT);
+    const episodeId = normalizeEpisodeId(body.episodeId);
+    if (!episodeId) fail(400, 'episodeId 无效，应形如 s01e01');
+    const catalog = normalizeCatalog(readCatalogRaw());
+    const episode = catalog.episodes.find((item) => item.episodeId === episodeId) || { episodeId };
+    const materialFile = path.join(episodeDir(episodeId), 'material.json');
+    if (!isFile(materialFile)) fail(400, '本集还没有生成物料');
+    const material = JSON.parse(fs.readFileSync(materialFile, 'utf8'));
+    diag(`lan-quiz: authoring quiz for ${episodeId}`);
+    const generated = await generateQuizWithLlm(material, episode);
+    writeFileAtomicJson(path.join(episodeDir(episodeId), 'quiz.json'), generated.quiz);
+    diag(`lan-quiz: wrote ${generated.questionCount} questions for ${episodeId} (${generated.quiz.generatorModel})`);
+    writeJson(res, 200, {
+      ok: true,
+      episodeId,
+      questionCount: generated.questionCount,
+      generator: generated.quiz.generator,
+      generatorModel: generated.quiz.generatorModel,
+    }, false);
+  } catch (error) {
+    const status = Number.isInteger(error && error.status) ? error.status : 500;
+    const message = String((error && error.message) || error);
+    diag(`lan-quiz: failed ${message}`);
+    writeJson(res, status, { ok: false, error: message, message }, false);
   }
 }
 
@@ -2222,6 +2706,42 @@ export function apply(ctx, config) {
       return () => {
         state.stt = null;
         diag('stt: speechToText unbound');
+      };
+    });
+    // Optional Host model services for teacher-quality quiz authoring.
+    scope(['llm'], (scoped) => {
+      let service = null;
+      try {
+        service = (scoped && scoped.llm) || null;
+      } catch (error) {
+        diag(`quiz: llm read failed ${String((error && error.message) || error)}`);
+      }
+      state.llm = service;
+      diag(`quiz: llm bound=${String(!!state.llm)}`);
+      return () => {
+        state.llm = null;
+        diag('quiz: llm unbound');
+      };
+    });
+    scope(['agentDefaultModel'], (scoped) => {
+      let service = null;
+      try {
+        service = (scoped && scoped.agentDefaultModel) || null;
+      } catch (error) {
+        diag(`quiz: agentDefaultModel read failed ${String((error && error.message) || error)}`);
+      }
+      state.agentDefaultModel = service;
+      let summary = 'none';
+      try {
+        const selection = service && typeof service.currentSelection === 'function' ? service.currentSelection() : null;
+        if (isPlainObject(selection) && selection.provider && selection.model) summary = `${selection.provider}/${selection.model}`;
+      } catch {
+        summary = '?';
+      }
+      diag(`quiz: agentDefaultModel bound=${String(!!state.agentDefaultModel)} selection=${summary}`);
+      return () => {
+        state.agentDefaultModel = null;
+        diag('quiz: agentDefaultModel unbound');
       };
     });
   } catch (error) {

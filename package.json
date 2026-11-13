@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-meiju-english",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Meiju English Learning for DeepSeek Harness: turn a US-TV episode plus bilingual subtitles into trimmed listening audio, sentence clips, offline-SenseVoice shadowing with word-level scoring, quizzes and a phone listening page. 美剧英语学习：把美剧视频和中英字幕变成去头尾音频、逐句跟读评分、测试题和手机磨耳朵页面。",
   "license": "MIT",
   "author": "jerfo0",
