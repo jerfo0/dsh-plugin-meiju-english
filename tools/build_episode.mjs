@@ -994,6 +994,68 @@ function quizShuffle(rng, list) {
   return out;
 }
 
+function quizMulberry32(seed) {
+  let value = seed >>> 0;
+  return function next() {
+    value = (value + 0x6d2b79f5) | 0;
+    let t = Math.imul(value ^ (value >>> 15), 1 | value);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/**
+ * Rotate option order deterministically so correct answers are spread evenly
+ * across A/B/C/D in a shuffled (not repeating) order.
+ */
+function rotateQuizAnswers(questions) {
+  if (!Array.isArray(questions) || !questions.length) return questions;
+  const seed = quizHashSeed(questions.map((question) => String(question.question || '')).join('|'));
+  const step = (seed >>> 3) & 1 ? 3 : 1;
+  const singles = [];
+  for (let i = 0; i < questions.length; i += 1) {
+    const question = questions[i];
+    if (Number.isInteger(question.answer) && Array.isArray(question.options) && question.options.length === 4) {
+      singles.push(i);
+    }
+  }
+  const desiredSlots = [];
+  for (let i = 0; i < singles.length; i += 1) desiredSlots.push(i % 4);
+  const rng = quizMulberry32(seed);
+  for (let i = desiredSlots.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(rng() * (i + 1));
+    const tmp = desiredSlots[i];
+    desiredSlots[i] = desiredSlots[j];
+    desiredSlots[j] = tmp;
+  }
+  const desiredByIndex = new Map();
+  singles.forEach((questionIndex, slot) => desiredByIndex.set(questionIndex, desiredSlots[slot]));
+  return questions.map((question, index) => {
+    const options = Array.isArray(question.options) ? question.options.slice() : [];
+    const count = options.length;
+    if (count < 2) return question;
+    if (Array.isArray(question.answers)) {
+      const rotation = ((seed >>> 7) + index * 5) % count;
+      if (!rotation) return question;
+      const rotated = options.slice(rotation).concat(options.slice(0, rotation));
+      const answers = question.answers
+        .map((value) => (value - rotation + count) % count)
+        .sort((left, right) => left - right);
+      return { ...question, options: rotated, answers };
+    }
+    if (Number.isInteger(question.answer)) {
+      const desired = desiredByIndex.has(index)
+        ? desiredByIndex.get(index)
+        : ((seed >>> 5) + index * step) % count;
+      const rotation = (question.answer - desired + count) % count;
+      if (!rotation) return question;
+      const rotated = options.slice(rotation).concat(options.slice(0, rotation));
+      return { ...question, options: rotated, answer: desired };
+    }
+    return question;
+  });
+}
+
 function quizNormPunct(text) {
   return String(text || '')
     .replace(/[.!?,;:"“”‘’()\[\]…]/g, ' ')
@@ -1271,7 +1333,7 @@ function generateQuiz(material, episodeId) {
     if (questions.length >= QUIZ_MAX_QUESTIONS) break;
   }
 
-  const shuffled = quizShuffle(rng, questions).map((question, i) => ({
+  const shuffled = rotateQuizAnswers(quizShuffle(rng, questions)).map((question, i) => ({
     id: `q${String(i + 1).padStart(2, '0')}`,
     ...question,
   }));

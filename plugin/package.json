@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-meiju-english",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "private": true,
   "description": "DSH 插件：美剧英语学习。用美剧视频和中英字幕生成去头尾音频、逐句片段、测试题、跟读与手机听力链接。",
   "keywords": [

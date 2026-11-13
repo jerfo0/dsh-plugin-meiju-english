@@ -988,6 +988,7 @@ function buildQuizPrompt(episode, material, batch) {
     '- 每题必须有 segmentIndex，且必须来自下面给出的台词编号；听力题的 segmentIndex 就是被播放的那句。',
     '- 单选题用 "answer": 数字；多选题用 "answers": [数字,...]（2-3 项正确）；单选题 4 个选项，多选 4-5 个选项。',
     '- 禁止出「下面哪句包含某个单词」这类关键词检索题；禁止题干直接给出答案；禁止选项明显荒谬或与题干无关。',
+    '- 正确答案的位置要分散（A/B/C/D 都出现），不要总是把正确项放在第一个。',
     '- 每题 explanation 用中文写清语言点，**控制在 45 字以内**，不要重复题干、不要长篇解释。',
     '- difficulty 取 1-3（1 简单、3 较难），本批难度要有梯度。',
     '',
@@ -1124,6 +1125,78 @@ function buildListeningQuestions(material, count) {
   return questions;
 }
 
+function quizTextSeed(text) {
+  let h = 2166136261;
+  for (let i = 0; i < text.length; i += 1) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+function quizMulberry32(seed) {
+  let value = seed >>> 0;
+  return function next() {
+    value = (value + 0x6d2b79f5) | 0;
+    let t = Math.imul(value ^ (value >>> 15), 1 | value);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/**
+ * Rotate each question's options deterministically so correct answers are spread
+ * evenly across A/B/C/D (in a randomly shuffled order, not a repeating cycle)
+ * instead of clustering in the first slot. Stable for the same quiz content.
+ */
+function rotateQuizAnswers(questions) {
+  if (!Array.isArray(questions) || !questions.length) return questions;
+  const seed = quizTextSeed(questions.map((question) => String(question.question || '')).join('|'));
+  const step = (seed >>> 3) & 1 ? 3 : 1;
+  const singles = [];
+  for (let i = 0; i < questions.length; i += 1) {
+    const question = questions[i];
+    if (Number.isInteger(question.answer) && Array.isArray(question.options) && question.options.length === 4) {
+      singles.push(i);
+    }
+  }
+  const desiredSlots = [];
+  for (let i = 0; i < singles.length; i += 1) desiredSlots.push(i % 4);
+  const rng = quizMulberry32(seed);
+  for (let i = desiredSlots.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(rng() * (i + 1));
+    const tmp = desiredSlots[i];
+    desiredSlots[i] = desiredSlots[j];
+    desiredSlots[j] = tmp;
+  }
+  const desiredByIndex = new Map();
+  singles.forEach((questionIndex, slot) => desiredByIndex.set(questionIndex, desiredSlots[slot]));
+  return questions.map((question, index) => {
+    const options = Array.isArray(question.options) ? question.options.slice() : [];
+    const count = options.length;
+    if (count < 2) return question;
+    if (Array.isArray(question.answers)) {
+      const rotation = ((seed >>> 7) + index * 5) % count;
+      if (!rotation) return question;
+      const rotated = options.slice(rotation).concat(options.slice(0, rotation));
+      const answers = question.answers
+        .map((value) => (value - rotation + count) % count)
+        .sort((left, right) => left - right);
+      return { ...question, options: rotated, answers };
+    }
+    if (Number.isInteger(question.answer)) {
+      const desired = desiredByIndex.has(index)
+        ? desiredByIndex.get(index)
+        : ((seed >>> 5) + index * step) % count;
+      const rotation = (question.answer - desired + count) % count;
+      if (!rotation) return question;
+      const rotated = options.slice(rotation).concat(options.slice(0, rotation));
+      return { ...question, options: rotated, answer: desired };
+    }
+    return question;
+  });
+}
+
 async function generateQuizWithLlm(material, episode) {
   const system = '你是一位资深英语老师，擅长根据美剧台词设计精读与听力测试题。你只输出一个合法 JSON 对象，不输出 markdown 或任何解释文字。';
   const batches = ['A', 'B', 'C'];
@@ -1172,7 +1245,8 @@ async function generateQuizWithLlm(material, episode) {
     seen.add(key);
     unique.push(question);
   }
-  const questions = unique.slice(0, 24).map((question, index) => ({
+  const rotatedQuestions = rotateQuizAnswers(unique.slice(0, 24));
+  const questions = rotatedQuestions.map((question, index) => ({
     id: `q${String(index + 1).padStart(2, '0')}`,
     ...question,
   }));
